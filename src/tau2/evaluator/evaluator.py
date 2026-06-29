@@ -161,7 +161,7 @@ def evaluate_simulation(
     except Exception:
         # If we can't get tool types, continue without them
         pass
-
+    # evaluation_type = EvaluationType.ALL_WITH_NL_ASSERTIONS
     if evaluation_type == EvaluationType.ENV:
         reward_info = EnvEvaluator.calculate_reward(
             environment_constructor=registry.get_env_constructor(domain),
