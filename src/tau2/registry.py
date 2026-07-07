@@ -14,7 +14,7 @@ from tau2.agent.llm_agent import (
     create_llm_gt_agent,
     create_llm_solo_agent,
 )
-from tau2.agent.memory_agent import create_policy_injection_agent
+from tau2.agent.policy_injection_agent import create_policy_injection_agent
 from tau2.data_model.tasks import Task
 from tau2.domains.airline.environment import (
     get_environment as airline_domain_get_environment,
