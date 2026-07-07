@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 import httpx
 import litellm
+from dotenv import load_dotenv
 from litellm import completion, completion_cost
 from litellm.caching.caching import Cache
 from litellm.main import ModelResponse, Usage
@@ -39,6 +40,10 @@ from tau2.data_model.message import (
     UserMessage,
 )
 from tau2.environment.tool import Tool
+
+load_dotenv()
+litellm.api_base = os.getenv("OPENAI_API_BASE")
+litellm.api_key = os.getenv("OPENAI_API_KEY")
 
 # Suppress Pydantic serialization warnings from LiteLLM
 # These occur due to type mismatches between streaming and non-streaming response types
