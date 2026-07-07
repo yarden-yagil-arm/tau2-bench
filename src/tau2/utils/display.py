@@ -1088,6 +1088,11 @@ class ConsoleDisplay:
                 "green" if pass_k > 0.8 else ("yellow" if pass_k > 0.5 else "red")
             )
             table.add_row(f"   Pass^{k}", f"[{pk_color}]{pass_k:.3f}[/]")
+        for k, pass_k in sorted(metrics.pass_star_ks.items()):
+            pk_color = (
+                "green" if pass_k > 0.8 else ("yellow" if pass_k > 0.5 else "red")
+            )
+            table.add_row(f"   Avg pass/{k}", f"[{pk_color}]{pass_k:.3f}[/]")
         table.add_row("💰 Avg Cost/Conversation", f"${metrics.avg_agent_cost:.4f}")
         table.add_row("", "")
 

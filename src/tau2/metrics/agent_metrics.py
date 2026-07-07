@@ -20,6 +20,7 @@ class AgentMetrics(BaseModel):
     # Core metrics
     avg_reward: float
     pass_hat_ks: dict[int, float]
+    pass_star_ks: dict[int, float]
     avg_agent_cost: float
 
     # Simulation counts
@@ -107,6 +108,8 @@ class AgentMetrics(BaseModel):
         }
         for k, v in self.pass_hat_ks.items():
             data[f"pass_hat_{k}"] = v
+        for k, v in self.pass_star_ks.items():
+            data[f"pass_star_{k}"] = v
         return data
 
 
@@ -124,6 +127,22 @@ def pass_hat_k(num_trials: int, success_count: int, k: int) -> float:
     if num_trials < k:
         raise ValueError(f"Number of trials {num_trials} is less than k {k}.")
     return math.comb(success_count, k) / math.comb(num_trials, k)
+
+
+def pass_star_k(num_trials: int, success_count: int, k: int) -> float:
+    """
+    Compute pass*k as the fraction of successful trials for a task.
+
+    Args:
+        num_trials: The number of trials.
+        success_count: The number of successful trials.
+        k: The number of trials to consider.
+    Returns:
+        The pass*k metric.
+    """
+    if num_trials < k:
+        raise ValueError(f"Number of trials {num_trials} is less than k {k}.")
+    return success_count / num_trials
 
 
 def get_metrics_df(results: Results) -> tuple[pd.DataFrame, int]:
@@ -175,11 +194,18 @@ def get_tasks_pass_hat_k(results: Results) -> pd.DataFrame:
         return pd.DataFrame()
     dfs = []
     for k in range(1, max_k + 1):
-        res = df.groupby("task_id")["success"].apply(
+        pass_hat_res = df.groupby("task_id")["success"].apply(
             lambda df: pass_hat_k(len(df), df.sum(), k)
         )
-        res.name = f"pass^{k}"
-        dfs.append(res)
+        pass_hat_res.name = f"pass^{k}"
+        dfs.append(pass_hat_res)
+
+        if k == max_k:
+            pass_star_res = df.groupby("task_id")["success"].apply(
+                lambda df: pass_star_k(len(df), df.sum(), k)
+            )
+            pass_star_res.name = f"pass*{k}"
+            dfs.append(pass_star_res)
     df_pass_hat_k = pd.concat(dfs, axis=1)
     task_columns = [
         "task_num_agent_actions",
@@ -211,6 +237,7 @@ def compute_metrics(results: Results) -> AgentMetrics:
         return AgentMetrics(
             avg_reward=0.0,
             pass_hat_ks={},
+            pass_star_ks={},
             avg_agent_cost=0.0,
         )
 
@@ -229,6 +256,7 @@ def compute_metrics(results: Results) -> AgentMetrics:
         return AgentMetrics(
             avg_reward=0.0,
             pass_hat_ks={},
+            pass_star_ks={},
             avg_agent_cost=0.0,
             total_simulations=0,
             total_tasks=0,
@@ -238,10 +266,14 @@ def compute_metrics(results: Results) -> AgentMetrics:
     df, df_pass_hat_k = prepare_dfs(results)
     avg_reward = df.reward.mean()
     pass_hat_ks = {}
+    pass_star_ks = {}
     for column in df_pass_hat_k.columns:
         if match := re.match(r"pass\^(\d+)", column):
             k = int(match.group(1))
             pass_hat_ks[k] = df_pass_hat_k[column].mean()
+        elif match := re.match(r"pass\*(\d+)", column):
+            k = int(match.group(1))
+            pass_star_ks[k] = df_pass_hat_k[column].mean()
     avg_agent_cost = df.agent_cost.mean()
 
     # Counts exclude infrastructure errors
@@ -446,6 +478,7 @@ def compute_metrics(results: Results) -> AgentMetrics:
     return AgentMetrics(
         avg_reward=avg_reward,
         pass_hat_ks=pass_hat_ks,
+        pass_star_ks=pass_star_ks,
         avg_agent_cost=avg_agent_cost,
         total_simulations=total_simulations,
         total_tasks=total_tasks,
@@ -487,6 +520,7 @@ def display_metrics(metrics: AgentMetrics) -> None:
     print("📈 Pass^k")
     for k, pass_hat_k in metrics.pass_hat_ks.items():
         print(f"  k={k}: {pass_hat_k}")
+    print(f"📈 Avg pass/{k}: {pass_star_k}")
     print(f"💰 Average agent cost: {metrics.avg_agent_cost}")
 
 
