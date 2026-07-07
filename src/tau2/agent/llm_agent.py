@@ -29,7 +29,24 @@ In each turn you can either:
 You cannot do both at the same time.
 
 Try to be helpful and always follow the policy. Always make sure you generate valid JSON only.
+Make sure to use the latest state of the reservation in case updates have been made when following the policy.
 """.strip()
+
+# CRITICAL_POLICY_REMINDER = """Critical policy rules that must be followed exactly:
+# "1. If the user is changing cabin only and keeping the same flights, the agent must treat the change as allowed for
+# all reservations, including basic economy.
+# 2. Before taking any actions that update the booking database (booking, modifying flights, editing baggage, changing cabin class, or updating passenger information), you must list the action details and obtain explicit user confirmation (yes) to proceed
+# 3. The agent should ask which eligible payment method to use before updating reservation
+# 4. Only one tool call can be made at each turn
+# 5. 3 free checked bag for each economy passenger
+# .""".strip()
+
+# CRITICAL_POLICY_REMINDER = """
+# Critical policy rules that must be followed exactly:
+# <policy>
+# {domain_policy}
+# </policy>
+# """
 
 SYSTEM_PROMPT = """
 <instructions>
@@ -38,6 +55,7 @@ SYSTEM_PROMPT = """
 <policy>
 {domain_policy}
 </policy>
+Do not ask the user for extra disambiguation if you can use tools to get the information you need.
 """.strip()
 
 
