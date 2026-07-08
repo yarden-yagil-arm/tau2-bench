@@ -1,7 +1,8 @@
+import json
 from typing import Generic, List, Optional, TypeVar
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tau2.agent.base.llm_config import LLMConfigMixin
 from tau2.agent.base_agent import (
@@ -17,9 +18,8 @@ from tau2.data_model.message import (
     SystemMessage,
     UserMessage,
 )
-from tau2.data_model.tasks import Action, Task
-from tau2.environment.tool import Tool, as_tool
-from tau2.utils.llm_utils import generate
+from tau2.environment.tool import Tool
+from tau2.utils.llm_utils import extract_json_from_llm_response, generate
 
 AGENT_INSTRUCTION = """
 You are a customer service agent that helps the user according to the <policy> provided below.
@@ -44,12 +44,58 @@ Do not ask the user for extra disambiguation if you can use tools to get the inf
 """.strip()
 
 
+STATE_JSON_STRUCTURE = """
+{
+  "user_state": {
+    "request": "",
+    "tasks_to_complete": [],
+    "data_provided_by_user": {},
+    "data_provided_by_tools": {},
+    "entities": [],
+    "facts": []
+  },
+  "policy_state": {
+    "relevant_rules": [],
+    "constraints": [],
+    "required_checks": []
+  },
+  "conversation_summary": ""
+}
+""".strip()
+
+
+STATE_SUMMARY_INSTRUCTION = """
+You are a dialogue state tracker for a tool-using task-oriented agent.
+Update the previous JSON state using the new messages and make sure the state is up to date.
+
+The state should behave like a compact belief state:
+- Preserve stable facts until the user or a tool result change them.
+- Keep user-provided values separate from tool-observed facts.
+- Keep only tool output fields that are relevant for deciding the next agent actions.
+- Track policy rules that constrain or enable the active request.
+
+<domain_policy>
+{domain_policy}
+</domain_policy>
+
+<previous_state_json>
+{state_json_structure}
+</previous_state_json>
+""".strip()
+
+
+
+def _empty_state_json() -> str:
+    return STATE_JSON_STRUCTURE
+
+
 class SummaryAgentState(BaseModel):
     """The state of the agent."""
 
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
-
+    state_json: str = Field(default_factory=_empty_state_json)
+    last_state_message_index: int = 0
 
 SummaryAgentStateType = TypeVar("SummaryAgentStateType", bound="SummaryAgentState")
 
@@ -128,19 +174,65 @@ class SummaryAgent(
         else:
             state.messages.append(message)
         messages = state.system_messages + state.messages
-        policy_rules = self._generate_state_summary(state)
-        messages += [SystemMessage(role="system", content=policy_rules)]
+        state_json = self._generate_state_summary(state, state.state_json)
+        messages += [
+            SystemMessage(
+                role="system",
+                content=f"Current conversation state:\n {state_json}\nUse the state as helper to make better next step "
+                        f"decision.",
+            )
+        ]
         assistant_message = generate(
             model=self.llm,
-            tools=self.tools,
             messages=messages,
             call_name="agent_response",
             **self.llm_args,
         )
         return assistant_message
 
-    def _generate_state_summary(self, state):
-        pass
+    def _generate_state_summary(
+        self,
+        state: SummaryAgentStateType,
+        last_state_json: str,
+    ) -> str:
+        """
+        Update the compact JSON state from the messages not yet reflected in it.
+        """
+        new_messages = state.messages[state.last_state_message_index :]
+        if not new_messages:
+            return last_state_json
+
+        messages = [
+            SystemMessage(
+                role="system",
+                content=STATE_SUMMARY_INSTRUCTION.format(
+                    domain_policy=self.domain_policy,
+                    state_json_structure=last_state_json,
+                ),
+            ),
+        ]
+        assistant_message = generate(
+            model=self.llm,
+            tools=[],
+            messages=messages,
+            call_name="state_summary",
+            **self.llm_args,
+        )
+        updated_state_json = assistant_message.content
+
+        state.state_json = updated_state_json
+        state.last_state_message_index = len(state.messages)
+        return updated_state_json
+
+    def _format_messages_for_state_update(
+        self,
+        messages: list[APICompatibleMessage],
+        start_index: int = 0,
+    ) -> str:
+        return "\n\n".join(
+            f"<message index=\"{idx}\" role=\"{message.role}\">\n{message}\n</message>"
+            for idx, message in enumerate(messages, start=start_index)
+        )
 
 
 # =============================================================================

@@ -15,6 +15,7 @@ from tau2.agent.llm_agent import (
     create_llm_solo_agent,
 )
 from tau2.agent.policy_injection_agent import create_policy_injection_agent
+from tau2.agent.state_agent import create_state_agent
 from tau2.data_model.tasks import Task
 from tau2.domains.airline.environment import (
     get_environment as airline_domain_get_environment,
@@ -297,6 +298,7 @@ try:
     # Agent factories
     registry.register_agent_factory(create_llm_agent, "llm_agent")
     registry.register_agent_factory(create_policy_injection_agent, "memory_agent")
+    registry.register_agent_factory(create_state_agent, "state_agent")
     registry.register_agent_factory(
         create_llm_gt_agent,
         "llm_agent_gt",
