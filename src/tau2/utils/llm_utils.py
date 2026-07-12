@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 import uuid
 import warnings
@@ -42,8 +43,28 @@ from tau2.data_model.message import (
 from tau2.environment.tool import Tool
 
 load_dotenv()
-litellm.api_base = os.getenv("OPENAI_API_BASE")
-litellm.api_key = os.getenv("OPENAI_API_KEY")
+
+
+def _load_openai_api_key() -> bool:
+    """Return whether traffic is using a VPN interface.
+    detection when using a split-tunnel VPN or an unusual network setup.
+    """
+    try:
+        route = subprocess.run(["route", "-n", "get", "default"], capture_output=True, check=True, text=True, timeout=2)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+
+    interface = next(
+        (line.split(":", maxsplit=1)[1].strip() for line in route.stdout.splitlines()
+            if line.strip().startswith("interface:")), "",)
+    is_vpn_active = interface.startswith(("utun", "tun", "tap", "ppp", "wg"))
+    if is_vpn_active:
+        return os.environ["OPENAI_API_KEY_HOME"]
+    else:
+        return os.environ["OPENAI_API_KEY_OFFICE"]
+
+
+litellm.api_key = _load_openai_api_key()
 
 # Suppress Pydantic serialization warnings from LiteLLM
 # These occur due to type mismatches between streaming and non-streaming response types
