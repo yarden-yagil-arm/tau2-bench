@@ -42,18 +42,22 @@ Do not ask the user for extra disambiguation if you can use tools to get the inf
 """.strip()
 
 
-class LLMAgentState(BaseModel):
+class UncertaintyDetectionAgentState(BaseModel):
     """The state of the agent."""
 
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
 
 
-LLMAgentStateType = TypeVar("LLMAgentStateType", bound="LLMAgentState")
+UncertaintyDetectionAgentStateType = TypeVar(
+    "UncertaintyDetectionAgentStateType", bound="UncertaintyDetectionAgentState"
+)
 
 
-class LLMAgent(
-    LLMConfigMixin, HalfDuplexAgent[LLMAgentStateType], Generic[LLMAgentStateType]
+class UncertaintyDetectionAgent(
+    LLMConfigMixin,
+    HalfDuplexAgent[UncertaintyDetectionAgentStateType],
+    Generic[UncertaintyDetectionAgentStateType],
 ):
     """
     A half-duplex LLM agent for turn-based conversations.
@@ -67,7 +71,7 @@ class LLMAgent(
         llm_args: Optional[dict] = None,
     ):
         """
-        Initialize the LLMAgent.
+        Initialize the UncertaintyDetectionAgent.
         """
         super().__init__(
             tools=tools,
@@ -84,7 +88,7 @@ class LLMAgent(
 
     def get_init_state(
         self, message_history: Optional[list[Message]] = None
-    ) -> LLMAgentStateType:
+    ) -> UncertaintyDetectionAgentStateType:
         """Get the initial state of the agent.
 
         Args:
@@ -98,14 +102,16 @@ class LLMAgent(
         assert all(is_valid_agent_history_message(m) for m in message_history), (
             "Message history must contain only AssistantMessage, UserMessage, or ToolMessage to Agent."
         )
-        return LLMAgentState(
+        return UncertaintyDetectionAgentState(
             system_messages=[SystemMessage(role="system", content=self.system_prompt)],
             messages=message_history,
         )
 
     def generate_next_message(
-        self, message: ValidAgentInputMessage, state: LLMAgentStateType
-    ) -> tuple[AssistantMessage, LLMAgentStateType]:
+        self,
+        message: ValidAgentInputMessage,
+        state: UncertaintyDetectionAgentStateType,
+    ) -> tuple[AssistantMessage, UncertaintyDetectionAgentStateType]:
         """
         Respond to a user or tool message.
         """
@@ -114,7 +120,9 @@ class LLMAgent(
         return assistant_message, state
 
     def _generate_next_message(
-        self, message: ValidAgentInputMessage, state: LLMAgentStateType
+        self,
+        message: ValidAgentInputMessage,
+        state: UncertaintyDetectionAgentStateType,
     ) -> AssistantMessage:
         """
         Generate the next message from a user or tool message.
@@ -141,8 +149,8 @@ class LLMAgent(
 # =============================================================================
 
 
-def create_llm_agent(tools, domain_policy, **kwargs):
-    """Factory function for LLMAgent.
+def create_uncertainty_detection_agent(tools, domain_policy, **kwargs):
+    """Factory function for UncertaintyDetectionAgent.
 
     Args:
         tools: Environment tools the agent can call.
@@ -151,7 +159,7 @@ def create_llm_agent(tools, domain_policy, **kwargs):
             - llm (str): LLM model name.
             - llm_args (dict): Additional LLM arguments.
     """
-    return LLMAgent(
+    return UncertaintyDetectionAgent(
         tools=tools,
         domain_policy=domain_policy,
         llm=kwargs.get("llm"),
