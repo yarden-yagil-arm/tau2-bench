@@ -45,15 +45,11 @@ from tau2.environment.tool import Tool
 load_dotenv()
 
 
-def _load_openai_api_key() -> bool:
-    """Return whether traffic is using a VPN interface.
-    detection when using a split-tunnel VPN or an unusual network setup.
+def _load_openai_api_key() -> str:
+    """Return api key according to whether VPN is active or not.
+    In case it is active, return the home api key, otherwise return the office api key.
     """
-    try:
-        route = subprocess.run(["route", "-n", "get", "default"], capture_output=True, check=True, text=True, timeout=2)
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return False
-
+    route = subprocess.run(["route", "-n", "get", "default"], capture_output=True, check=True, text=True, timeout=2)
     interface = next(
         (line.split(":", maxsplit=1)[1].strip() for line in route.stdout.splitlines()
             if line.strip().startswith("interface:")), "",)
