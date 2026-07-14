@@ -1,3 +1,4 @@
+import json
 from typing import Generic, List, Optional, TypeVar
 
 from pydantic import BaseModel
@@ -40,26 +41,76 @@ Do not ask the user for extra disambiguation if you can use tools to get the inf
 </policy>
 """.strip()
 
-TOOL_PATH_PROMPT = """"""
+POST_RESERVATION_LOOKUP_PROMPT = (
+    "Most likely tool to call next: update_reservation_flights"
+)
 
-class PolicyInjectionAgentState(BaseModel):
+TOOL_PATH_PROMPT = """
+Before taking action on the user's response, suggest optional tool-call trajectories
+that explain which available tools should be used, and in what order, to solve the
+task. Plan each trajectory forward from the current conversation state, rather than
+from the beginning of the task. Take into consideration the domain policy, tool-call
+dependencies, tools already called, and the results already available.
 
+- Use the exact names of available tools and do not invent tools.
+- If multiple viable tool sequences exist, suggest all of them.
+- Do not call a tool in this response; only present the proposed tool trajectories.
+- Each tool call should include tool name and arguments. If arguments are not known, use placeholders of <depends on previous tool call> or <requires user info>.
+
+The tool calls already made are provided separately in chronological order:
+<tool_calls_already_made_in_order>
+{tool_calls_already_made}
+</tool_calls_already_made_in_order>
+
+Create a list where each entry contains an optional tool calls trajectory to solve the user request, the probability score of success for that trajectory, and any risks associated with that trajectory.
+The probability score should be a float between 0 and 1, where 1 indicates a high likelihood of success and 0
+indicates a low likelihood of success.
+The risks should be a brief description of any potential issues or challenges that may arise when following that trajectory.
+The dependencies is a dictionary were the keys are tools from the suggests trajectory, and the value of each tool is
+a list of tools that must be called before it in order for it to succeed. If there are no dependencies, use an empty
+list. If multiple tools depend on the same tool, for example tools B and C depend on tool A, and the output of tool A may require calling C before B than add tool C to the dependencies of tool B.
+use the following format:
+[
+    {{
+        "tools": ["tool_a", "tool_b", "tool_c"],
+        "score": 0.9,
+        "risks": "Dependencies between tool calls that can cause failure.",
+        "dependencies": {{"tool_a": [], "tool_b": ["tool_a"], "tool_c": ["tool_a", "tool_b"]}}
+    }},
+    {{
+        "tools": ["tool_b", "tool_c", "tool_a"],
+        "score": 0.9,
+        "risks": "Dependencies between tool calls that can cause failure.",
+        "dependencies": {{"tool_a": [], "tool_b": ["tool_a"], "tool_c": ["tool_a", "tool_b"]}}
+    }},
+    {{
+        "tools": ["tool_a", "tool_b", "tool_d"],
+        "score": 0.9,
+        "risks": "Dependencies between tool calls that can cause failure.",
+        "dependencies": {{"tool_a": [], "tool_b": ["tool_a"], "tool_c": ["tool_a", "tool_b"]}}
+    }}
+]
+""".strip()
+
+
+class ToolPathAgentState(BaseModel):
     """The state of the agent."""
 
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
+    first_tool_calls_suggestions: Optional[list[dict]] = None
+    high_trajectory_confidence: bool = True
 
 
-MemoryAgentStateType = TypeVar("MemoryAgentStateType", bound="PolicyInjectionAgentState")
+ToolPathAgentStateType = TypeVar("ToolPathAgentStateType", bound="ToolPathAgentState")
 
 
-class PolicyInjectionAgent(
-    LLMConfigMixin, HalfDuplexAgent[MemoryAgentStateType], Generic[MemoryAgentStateType]
+class ToolPathAgent(
+    LLMConfigMixin,
+    HalfDuplexAgent[ToolPathAgentStateType],
+    Generic[ToolPathAgentStateType],
 ):
-    """
-    A half-duplex agent for turn-based conversations. The agent injects before each agent turn the most
-    relevant policy rules from the domain policy.
-    """
+    """A half-duplex agent that proposes tool paths for the user's request."""
 
     def __init__(
         self,
@@ -69,7 +120,7 @@ class PolicyInjectionAgent(
         llm_args: Optional[dict] = None,
     ):
         """
-        Initialize the PolicyInjectionAgent.
+        Initialize the ToolPathAgent.
         """
         super().__init__(
             tools=tools,
@@ -86,7 +137,7 @@ class PolicyInjectionAgent(
 
     def get_init_state(
         self, message_history: Optional[list[Message]] = None
-    ) -> MemoryAgentStateType:
+    ) -> ToolPathAgentStateType:
         """Get the initial state of the agent.
 
         Args:
@@ -100,14 +151,14 @@ class PolicyInjectionAgent(
         assert all(is_valid_agent_history_message(m) for m in message_history), (
             "Message history must contain only AssistantMessage, UserMessage, or ToolMessage to Agent."
         )
-        return PolicyInjectionAgentState(
+        return ToolPathAgentState(
             system_messages=[SystemMessage(role="system", content=self.system_prompt)],
-            messages=message_history,
+            messages=list(message_history),
         )
 
     def generate_next_message(
-        self, message: ValidAgentInputMessage, state: MemoryAgentStateType
-    ) -> tuple[AssistantMessage, MemoryAgentStateType]:
+        self, message: ValidAgentInputMessage, state: ToolPathAgentStateType
+    ) -> tuple[AssistantMessage, ToolPathAgentStateType]:
         """
         Respond to a user or tool message.
         """
@@ -115,26 +166,46 @@ class PolicyInjectionAgent(
         state.messages.append(assistant_message)
         return assistant_message, state
 
-    def _format_context(self, messages: list[APICompatibleMessage]) -> str:
-        return "\n\n".join(
-            f"<message index=\"{idx}\">\n{message}\n</message>"
-            for idx, message in enumerate(messages)
+    def _generate_tools_trajectory(
+        self, messages: list[APICompatibleMessage]
+    ) -> list[dict]:
+        """
+        Generate the next message from a user or tool message.
+        """
+        tool_calls_already_made = [
+            {
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            }
+            for message in messages
+            if isinstance(message, AssistantMessage) and message.tool_calls
+            for tool_call in message.tool_calls
+        ]
+        trajectory_prompt = TOOL_PATH_PROMPT.format(
+            tool_calls_already_made=json.dumps(tool_calls_already_made, indent=2)
         )
-
-    def _generate_policy_rules(self, state: list[APICompatibleMessage]) -> str:
-        messages = (state.system_messages + state.messages
-                     + [SystemMessage(role="system", content=POLICY_RULES_INSTRUCTION)])
         assistant_message = generate(
             model=self.llm,
-            tools=[],
-            messages=messages,
-            call_name="policy_rules",
+            tools=self.tools,
+            messages=messages
+            + [SystemMessage(role="system", content=trajectory_prompt)],
+            call_name="tool_path_response",
             **self.llm_args,
         )
-        return "Critical policy rules that must be followed exactly:\n" + assistant_message.content.strip()
+        if assistant_message.content is None:
+            raise ValueError("Tool trajectory response must contain JSON content.")
+        try:
+            trajectories = json.loads(assistant_message.content)
+        except json.JSONDecodeError as error:
+            raise ValueError("Tool trajectory response must be valid JSON.") from error
+        if not isinstance(trajectories, list) or not all(
+            isinstance(trajectory, dict) for trajectory in trajectories
+        ):
+            raise ValueError("Tool trajectory response must be a JSON list of objects.")
+        return trajectories
 
     def _generate_next_message(
-        self, message: ValidAgentInputMessage, state: MemoryAgentStateType
+        self, message: ValidAgentInputMessage, state: ToolPathAgentStateType
     ) -> AssistantMessage:
         """
         Generate the next message from a user or tool message.
@@ -145,13 +216,38 @@ class PolicyInjectionAgent(
             state.messages.extend(message.tool_messages)
         else:
             state.messages.append(message)
-        messages = (state.system_messages + state.messages)
-        policy_rules = self._generate_policy_rules(state)
-        messages += [SystemMessage(role="system", content=policy_rules)]
+        messages = state.system_messages + state.messages
+        optional_tool_trajectories = self._generate_tools_trajectory(messages)
+        if state.first_tool_calls_suggestions is None:
+            state.first_tool_calls_suggestions = optional_tool_trajectories
+            if len(optional_tool_trajectories) > 1:
+                state.high_trajectory_confidence = False
+            print("Tool Path Trajectory Suggestion:")
+            print(json.dumps(optional_tool_trajectories, indent=2))
+        called_tool_names = {
+            tool_call.name
+            for history_message in state.messages
+            if isinstance(history_message, AssistantMessage)
+            and history_message.tool_calls
+            for tool_call in history_message.tool_calls
+        }
+        get_reservation_details_called = "get_reservation_details" in called_tool_names
+        reservation_update_already_called = bool(
+            {
+                "update_reservation_flights",
+                "update_reservation_passengers",
+            }
+            & called_tool_names
+        )
+        agent_messages = list(messages)
+        if get_reservation_details_called and not reservation_update_already_called:
+            agent_messages.append(
+                SystemMessage(role="system", content=POST_RESERVATION_LOOKUP_PROMPT)
+            )
         assistant_message = generate(
             model=self.llm,
             tools=self.tools,
-            messages=messages,
+            messages=agent_messages,
             call_name="agent_response",
             **self.llm_args,
         )
@@ -163,8 +259,8 @@ class PolicyInjectionAgent(
 # =============================================================================
 
 
-def create_policy_injection_agent(tools, domain_policy, **kwargs):
-    """Factory function for MemoryAgent.
+def create_tool_path_agent(tools, domain_policy, **kwargs):
+    """Factory function for ToolPathAgent.
 
     Args:
         tools: Environment tools the agent can call.
@@ -173,7 +269,7 @@ def create_policy_injection_agent(tools, domain_policy, **kwargs):
             - llm (str): LLM model name.
             - llm_args (dict): Additional LLM arguments.
     """
-    return PolicyInjectionAgent(
+    return ToolPathAgent(
         tools=tools,
         domain_policy=domain_policy,
         llm=kwargs.get("llm"),

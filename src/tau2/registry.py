@@ -17,6 +17,7 @@ from tau2.agent.llm_agent import (
 from tau2.agent.logprobs_agent import create_uncertainty_detection_agent
 from tau2.agent.policy_injection_agent import create_policy_injection_agent
 from tau2.agent.state_agent import create_state_agent
+from tau2.agent.tool_path_agent import create_tool_path_agent
 from tau2.data_model.tasks import Task
 from tau2.domains.airline.environment import (
     get_environment as airline_domain_get_environment,
@@ -301,6 +302,7 @@ try:
     registry.register_agent_factory(create_uncertainty_detection_agent, "UD_agent")
     registry.register_agent_factory(create_policy_injection_agent, "memory_agent")
     registry.register_agent_factory(create_state_agent, "state_agent")
+    registry.register_agent_factory(create_tool_path_agent, "tool_path_agent")
     registry.register_agent_factory(
         create_llm_gt_agent,
         "llm_agent_gt",
