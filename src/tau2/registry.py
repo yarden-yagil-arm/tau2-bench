@@ -300,7 +300,7 @@ try:
     # Agent factories
     registry.register_agent_factory(create_llm_agent, "llm_agent")
     registry.register_agent_factory(create_uncertainty_detection_agent, "UD_agent")
-    registry.register_agent_factory(create_policy_injection_agent, "memory_agent")
+    registry.register_agent_factory(create_policy_injection_agent, "policy_agent")
     registry.register_agent_factory(create_state_agent, "state_agent")
     registry.register_agent_factory(create_tool_path_agent, "tool_path_agent")
     registry.register_agent_factory(

@@ -41,9 +41,18 @@ Do not ask the user for extra disambiguation if you can use tools to get the inf
 </policy>
 """.strip()
 
-POST_RESERVATION_LOOKUP_PROMPT = (
-    "Most likely tool to call next: update_reservation_flights"
-)
+POLICY_RULES_INSTRUCTION = """
+Your goal is to select the most relevant policy rules from the policy in order to help the agent following the 
+policy, since it is very long. Given the conversation between the agent and user, which contains the policy, 
+the user request and the state of 
+the reservation, 
+you should select the most relevant 
+policy rules that are important for the to agent remember before its next action. Select up to 6 policy rules. Try to be concise, 
+select only most relevant policy rules, 
+you can summerize them and use 
+a more strict policy phrasing.
+Do not add any additional information or explanation.
+""".strip()
 
 TOOL_PATH_PROMPT = """
 Before taking action on the user's response, suggest optional tool-call trajectories
@@ -63,29 +72,45 @@ The tool calls already made are provided separately in chronological order:
 </tool_calls_already_made_in_order>
 
 Create a list where each entry contains an optional tool calls trajectory to solve the user request, the probability score of success for that trajectory, and any risks associated with that trajectory.
+The tools is a list of the tools in the trajectory, in the order they should be called. Each tool should be represented as a dictionary with the following keys:
+- "tool": The name of the tool.
+- "goal": A brief description of what the tool is trying to achieve.
 The probability score should be a float between 0 and 1, where 1 indicates a high likelihood of success and 0
 indicates a low likelihood of success.
 The risks should be a brief description of any potential issues or challenges that may arise when following that trajectory.
 The dependencies is a dictionary were the keys are tools from the suggests trajectory, and the value of each tool is
-a list of tools that must be called before it in order for it to succeed. If there are no dependencies, use an empty
+a list of tools that must be called before it in order for it to succeed. If 
+there are no dependencies, use an empty
 list. If multiple tools depend on the same tool, for example tools B and C depend on tool A, and the output of tool A may require calling C before B than add tool C to the dependencies of tool B.
 use the following format:
 [
     {{
-        "tools": ["tool_a", "tool_b", "tool_c"],
+        "tools": [
+            {{"tool": "tool_a", "goal": "What tool_a is trying to achieve."}},
+            {{"tool": "tool_b", "goal": "What tool_b is trying to achieve."}},
+            {{"tool": "tool_c", "goal": "What tool_c is trying to achieve."}}
+        ],
         "score": 0.9,
         "risks": "Dependencies between tool calls that can cause failure.",
         "dependencies": {{"tool_a": [], "tool_b": ["tool_a"], "tool_c": ["tool_a", "tool_b"]}}
     }},
     {{
-        "tools": ["tool_b", "tool_c", "tool_a"],
+        "tools": [
+            {{"tool": "tool_b", "goal": "What tool_b is trying to achieve."}},
+            {{"tool": "tool_c", "goal": "What tool_c is trying to achieve."}},
+            {{"tool": "tool_a", "goal": "What tool_a is trying to achieve."}}
+        ],
         "score": 0.9,
         "risks": "Dependencies between tool calls that can cause failure.",
         "dependencies": {{"tool_a": [], "tool_b": ["tool_a"], "tool_c": ["tool_a", "tool_b"]}}
     }},
     {{
-        "tools": ["tool_a", "tool_b", "tool_d"],
-        "score": 0.9,
+        "tools": [
+            {{"tool": "tool_a", "goal": "What tool_a is trying to achieve."}},
+            {{"tool": "tool_b", "goal": "What tool_b is trying to achieve."}},
+            {{"tool": "tool_d", "goal": "What tool_d is trying to achieve."}}
+        ],
+        "score": 0.8,
         "risks": "Dependencies between tool calls that can cause failure.",
         "dependencies": {{"tool_a": [], "tool_b": ["tool_a"], "tool_c": ["tool_a", "tool_b"]}}
     }}
@@ -93,12 +118,21 @@ use the following format:
 """.strip()
 
 
+REQUIRED_TOOL_NAMES_TASK_17 = [
+    "get_user_details", "get_reservation_details", "get_reservation_details", "get_reservation_details",
+        "get_reservation_details", "update_reservation_flights",
+        "update_reservation_passengers", "update_reservation_baggages",
+]
+
+
 class ToolPathAgentState(BaseModel):
     """The state of the agent."""
 
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
+    required_tool_calls: list[str]
     first_tool_calls_suggestions: Optional[list[dict]] = None
+    current_trajectory_suggestion: Optional[dict] = None
     high_trajectory_confidence: bool = True
 
 
@@ -154,6 +188,7 @@ class ToolPathAgent(
         return ToolPathAgentState(
             system_messages=[SystemMessage(role="system", content=self.system_prompt)],
             messages=list(message_history),
+            required_tool_calls=[],
         )
 
     def generate_next_message(
@@ -202,7 +237,112 @@ class ToolPathAgent(
             isinstance(trajectory, dict) for trajectory in trajectories
         ):
             raise ValueError("Tool trajectory response must be a JSON list of objects.")
+        for trajectory in trajectories:
+            for tool in trajectory.get("tools", []):
+                if isinstance(tool, dict) and isinstance(tool.get("tool"), str):
+                    tool["tool"] = tool["tool"].removeprefix("functions.")
         return trajectories
+
+    @staticmethod
+    def _get_highest_probability_trajectory(
+        optional_tool_trajectories: list[dict],
+    ) -> Optional[dict]:
+        """Return the complete trajectory object with the highest score."""
+        if not optional_tool_trajectories:
+            return None
+
+        for trajectory in optional_tool_trajectories:
+            if not isinstance(trajectory.get("score"), (int, float)):
+                raise ValueError("Every tool trajectory must have a numeric score.")
+            tools = trajectory.get("tools")
+            if not isinstance(tools, list) or not all(
+                isinstance(tool, dict)
+                and isinstance(tool.get("tool"), str)
+                and isinstance(tool.get("goal"), str)
+                for tool in tools
+            ):
+                raise ValueError(
+                    "Every tool trajectory must have a tools list containing "
+                    "objects with string 'tool' and 'goal' fields."
+                )
+
+        return max(
+            optional_tool_trajectories,
+            key=lambda trajectory: trajectory["score"],
+        )
+
+    def _generate_next_tool_policy_rules(
+        self,
+        agent_messages: list[APICompatibleMessage],
+        required_tool_calls: list[str],
+        current_trajectory_suggestion: Optional[dict],
+    ) -> str | None:
+
+        if len(required_tool_calls) == 0:
+            return None
+        next_required_tool = required_tool_calls[0]
+        next_tool_goal = self._get_tool_goal(
+            current_trajectory_suggestion, next_required_tool
+        )
+        next_action_instruction = f"""
+        Your goal is to select the most relevant policy rules from the policy in order to help the agent following the 
+        policy, since it is very long. Given the conversation between the agent and user, which contains the policy, 
+        the user request and the state of the reservation, you should select the most relevant 
+        policy rules that are important for the to agent remember before its next tool call, 
+        focusing on policy rules that are relevant to the next tool call and the goal this tool is trying to achieve.
+        Next tool to be called: {next_required_tool}
+        Tool goal: {next_tool_goal}
+        User Data: <list of required user info and preferences for the tool to succeed>
+        Relevant Policy Rules:
+    """.strip()
+
+        policy_messages = agent_messages + [SystemMessage(role="system", content=next_action_instruction)]
+        assistant_message = generate(
+            model=self.llm,
+            tools=[],
+            messages=policy_messages,
+            call_name="policy_rules",
+            **self.llm_args,
+        )
+        return f"Critical policy rules that must be followed exactly in order to call {next_required_tool}:\n{assistant_message.content.strip()}"
+
+    @staticmethod
+    def _get_tool_goal(
+        current_trajectory_suggestion: Optional[dict],
+        tool_name: str,
+    ) -> str:
+        """Return a tool's goal from the current selected trajectory."""
+        if not current_trajectory_suggestion:
+            return (
+                f"Determine the single atomic goal for {tool_name} from its tool "
+                "schema and the current conversation state."
+            )
+
+        for tool in current_trajectory_suggestion.get("tools", []):
+            if not isinstance(tool, dict):
+                continue
+            suggested_tool_name = str(tool.get("tool", ""))
+            goal = tool.get("goal")
+            if suggested_tool_name == tool_name and isinstance(goal, str):
+                stripped_goal = goal.strip()
+                if stripped_goal:
+                    return stripped_goal
+
+        return (
+            f"Determine the single atomic goal for {tool_name} from its tool "
+            "schema and the current conversation state."
+        )
+
+    def _generate_policy_rules(self, state: ToolPathAgentState) -> str:
+        messages = (state.system_messages + state.messages + [SystemMessage(role="system", content=POLICY_RULES_INSTRUCTION)])
+        assistant_message = generate(
+            model=self.llm,
+            tools=[],
+            messages=messages,
+            call_name="policy_rules",
+            **self.llm_args,
+        )
+        return "Critical policy rules that must be followed exactly:\n" + assistant_message.content.strip()
 
     def _generate_next_message(
         self, message: ValidAgentInputMessage, state: ToolPathAgentStateType
@@ -218,32 +358,18 @@ class ToolPathAgent(
             state.messages.append(message)
         messages = state.system_messages + state.messages
         optional_tool_trajectories = self._generate_tools_trajectory(messages)
+        state.current_trajectory_suggestion = self._get_highest_probability_trajectory(optional_tool_trajectories)
+        state.required_tool_calls = [tool["tool"] for tool in (state.current_trajectory_suggestion.get("tools", [])
+                if state.current_trajectory_suggestion else [])]
+        print("Tool Path Trajectory Suggestion:", state.required_tool_calls)
         if state.first_tool_calls_suggestions is None:
             state.first_tool_calls_suggestions = optional_tool_trajectories
             if len(optional_tool_trajectories) > 1:
                 state.high_trajectory_confidence = False
-            print("Tool Path Trajectory Suggestion:")
-            print(json.dumps(optional_tool_trajectories, indent=2))
-        called_tool_names = {
-            tool_call.name
-            for history_message in state.messages
-            if isinstance(history_message, AssistantMessage)
-            and history_message.tool_calls
-            for tool_call in history_message.tool_calls
-        }
-        get_reservation_details_called = "get_reservation_details" in called_tool_names
-        reservation_update_already_called = bool(
-            {
-                "update_reservation_flights",
-                "update_reservation_passengers",
-            }
-            & called_tool_names
-        )
         agent_messages = list(messages)
-        if get_reservation_details_called and not reservation_update_already_called:
-            agent_messages.append(
-                SystemMessage(role="system", content=POST_RESERVATION_LOOKUP_PROMPT)
-            )
+        next_tool_policy_rules = self._generate_next_tool_policy_rules(agent_messages, state.required_tool_calls, state.current_trajectory_suggestion,)
+        if next_tool_policy_rules:
+            agent_messages += [SystemMessage(role="system", content=next_tool_policy_rules)]
         assistant_message = generate(
             model=self.llm,
             tools=self.tools,
