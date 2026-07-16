@@ -42,6 +42,10 @@ from tau2.data_model.message import (
 )
 from tau2.environment.tool import Tool
 
+
+import time
+import ollama
+from types import SimpleNamespace
 load_dotenv()
 
 
@@ -187,7 +191,7 @@ def to_tau2_messages(
     return tau2_messages
 
 
-def to_litellm_messages(messages: list[Message]) -> list[dict]:
+def to_litellm_messages(messages: list[Message], model: str) -> list[dict]:
     """
     Convert a list of Tau2 messages to a list of litellm messages.
     """
@@ -204,7 +208,7 @@ def to_litellm_messages(messages: list[Message]) -> list[dict]:
                         "name": tc.name,
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments),
+                            "arguments": tc.arguments if "ollama" in model else json.dumps(tc.arguments),
                         },
                         "type": "function",
                     }
@@ -407,7 +411,7 @@ def generate(
     ):
         os.environ["VERTEXAI_LOCATION"] = "global"
 
-    litellm_messages = to_litellm_messages(messages)
+    litellm_messages = to_litellm_messages(messages, model)
     tools_schema = [tool.openai_schema for tool in tools] if tools else None
     if tools_schema and tool_choice is None:
         tool_choice = "auto"
@@ -428,23 +432,31 @@ def generate(
 
     start_time = time.perf_counter()
     try:
-        response = completion(
-            model=model,
-            messages=litellm_messages,
-            tools=tools_schema,
-            tool_choice=tool_choice,
-            **kwargs,
-        )
+        if "ollama" in model.lower():
+            response = get_ollama_response(model=model.split("/")[-1],
+                                           messages=litellm_messages,
+                                           tools=tools,
+                                           return_raw_response=True,
+                                           model_type='ollama',
+                                           max_length=8000)
+        else:
+            response = completion(
+                model=model,
+                messages=litellm_messages,
+                tools=tools_schema,
+                tool_choice=tool_choice,
+                **kwargs,
+            )
     except Exception as e:
         logger.error(e)
         raise e
     generation_time_seconds = time.perf_counter() - start_time
-    cost = get_response_cost(response)
+    cost = 0.0 if "ollama" in model else get_response_cost(response)
     usage = get_response_usage(response)
 
-    response_choice = response.choices[0]
+    response_choice = response if "ollama" in model else response.choices[0]
     try:
-        finish_reason = response_choice.finish_reason
+        finish_reason = response_choice.done_reason if "ollama" in model else response_choice.finish_reason
         if finish_reason == "length":
             logger.warning("Output might be incomplete due to token limit!")
     except Exception as e:
@@ -456,22 +468,19 @@ def generate(
     content = response_choice.message.content
     raw_tool_calls = response_choice.message.tool_calls or []
     tool_calls = [
-        ToolCall(
-            id=tool_call.id,
-            name=tool_call.function.name,
-            arguments=json.loads(tool_call.function.arguments),
-        )
+        ToolCall(id="", name=tool_call["function"]["name"], arguments=tool_call["function"]["arguments"]) if "ollama" in model else
+        ToolCall(id=tool_call.id, name=tool_call.function.name, arguments=json.loads(tool_call.function.arguments))
         for tool_call in raw_tool_calls
     ]
     tool_calls = tool_calls or None
-
+    response_dict = json.loads(json.dumps(response, default=lambda o: o.__dict__)) if "ollama" in model else response.to_dict()
     message = AssistantMessage(
         role="assistant",
         content=content,
         tool_calls=tool_calls,
         cost=cost,
         usage=usage,
-        raw_data=response.to_dict(),
+        raw_data=response_dict,
         generation_time_seconds=generation_time_seconds,
     )
 
@@ -490,6 +499,31 @@ def generate(
 
     return message
 
+def get_ollama_response(model, messages, temperature=1.0, return_raw_response=False, tools=None, show_messages=False,
+                        model_type=None, max_length=1024, model_config=None, model_config_idx=0, model_config_path=None,
+                        payload=None, openai_client_type='azure_openai', **kwargs):
+    if isinstance(messages, str):
+        messages = [{'role': 'user', 'content': messages}]
+    if model_type != 'ollama':
+        raise Exception("Invalid model type")
+    answer = SimpleNamespace(message=SimpleNamespace(content="", tool_calls=None))  # empty message placeholder
+    while answer.message.content == "" and answer.message.tool_calls is None:
+        try:
+            answer = ollama.chat(model=model,
+                                          messages=messages,
+                                          tools = tools,
+                                          # think=True,
+                                          options={"temperature": temperature,
+                                                   "num_predict": max_length,
+                                                   })
+
+        except Exception as error:
+            print('Error', error)
+            time.sleep(60)
+    if return_raw_response:
+        return answer
+    else:
+        return answer.message.content
 
 def get_cost(messages: list[Message]) -> tuple[float, float] | None:
     """
