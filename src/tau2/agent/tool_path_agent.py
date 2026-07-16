@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import Generic, List, Optional, TypeVar
 
 from pydantic import BaseModel
@@ -17,8 +18,14 @@ from tau2.data_model.message import (
     SystemMessage,
     UserMessage,
 )
+from tau2.data_model.simulation import Results
+from tau2.data_model.tasks import Task
 from tau2.environment.tool import Tool
+from tau2.metrics.agent_metrics import is_successful
 from tau2.utils.llm_utils import generate
+
+PASSED_SIMULATIONS_PATH = Path("/Users/yaryag01/Library/CloudStorage/OneDrive-Arm/Documents/research/external_memory/tau2-bench/data/simulations"
+                               "/airline_llm_agent_10_trails/results.json")
 
 AGENT_INSTRUCTION = """
 You are a customer service agent that helps the user according to the <policy> provided below.
@@ -41,18 +48,6 @@ Do not ask the user for extra disambiguation if you can use tools to get the inf
 </policy>
 """.strip()
 
-POLICY_RULES_INSTRUCTION = """
-Your goal is to select the most relevant policy rules from the policy in order to help the agent following the 
-policy, since it is very long. Given the conversation between the agent and user, which contains the policy, 
-the user request and the state of 
-the reservation, 
-you should select the most relevant 
-policy rules that are important for the to agent remember before its next action. Select up to 6 policy rules. Try to be concise, 
-select only most relevant policy rules, 
-you can summerize them and use 
-a more strict policy phrasing.
-Do not add any additional information or explanation.
-""".strip()
 
 TOOL_PATH_PROMPT = """
 Before taking action on the user's response, suggest optional tool-call trajectories
@@ -65,6 +60,8 @@ dependencies, tools already called, and the results already available.
 - If multiple viable tool sequences exist, suggest all of them.
 - Do not call a tool in this response; only present the proposed tool trajectories.
 - Each tool call should include tool name and arguments. If arguments are not known, use placeholders of <depends on previous tool call> or <requires user info>.
+
+{gold_trajectory_instruction}
 
 The tool calls already made are provided separately in chronological order:
 <tool_calls_already_made_in_order>
@@ -117,6 +114,14 @@ use the following format:
 ]
 """.strip()
 
+GOLD_TOOL_PATH_INSTRUCTION = """
+- Here is a gold tool-call trajectory for the same scenario:
+{gold_tool_calls}
+
+- Use the gold trajectory to make a better tool-trajectory prediction while taking into consideration both the gold trajectory and the current conversation state. 
+Do not blindly copy the gold trajectory, take it into consideration while also considering the previous tool calls that were made and the conversation state.
+""".strip()
+
 
 REQUIRED_TOOL_NAMES_TASK_17 = [
     "get_user_details", "get_reservation_details", "get_reservation_details", "get_reservation_details",
@@ -131,10 +136,10 @@ class ToolPathAgentState(BaseModel):
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
     required_tool_calls: list[str]
+    use_gold_trajectory: bool = True
     first_tool_calls_suggestions: Optional[list[dict]] = None
     current_trajectory_suggestion: Optional[dict] = None
-    high_trajectory_confidence: bool = True
-
+    print("Gold trajectory is on:", use_gold_trajectory)
 
 ToolPathAgentStateType = TypeVar("ToolPathAgentStateType", bound="ToolPathAgentState")
 
@@ -152,6 +157,7 @@ class ToolPathAgent(
         domain_policy: str,
         llm: str,
         llm_args: Optional[dict] = None,
+        task: Optional[Task] = None,
     ):
         """
         Initialize the ToolPathAgent.
@@ -162,6 +168,20 @@ class ToolPathAgent(
             llm=llm,
             llm_args=llm_args,
         )
+        self.task = task
+        self.gold_trajectory = None
+
+    @staticmethod
+    def load_gold_tool_calls(task_id: str, simulations_path: str | Path = PASSED_SIMULATIONS_PATH) -> list[str]:
+        """Return tool-call names from the shortest passed trial for a task."""
+        results = Results.load(Path(simulations_path))
+        passed_trials_tool_calls = []
+        for simulation in results.simulations:
+            if simulation.task_id != str(task_id) or simulation.reward_info is None or not is_successful(simulation.reward_info.reward):
+                continue
+            tool_call_names = [tool_call.name for message in simulation.get_messages() if isinstance(message, AssistantMessage) and message.tool_calls for tool_call in message.tool_calls]
+            passed_trials_tool_calls.append(tool_call_names)
+        return min(passed_trials_tool_calls, key=len) if passed_trials_tool_calls else []
 
     @property
     def system_prompt(self) -> str:
@@ -201,13 +221,10 @@ class ToolPathAgent(
         state.messages.append(assistant_message)
         return assistant_message, state
 
-    def _generate_tools_trajectory(
-        self, messages: list[APICompatibleMessage]
-    ) -> list[dict]:
-        """
-        Generate the next message from a user or tool message.
-        """
-        tool_calls_already_made = [
+    @staticmethod
+    def _get_tool_calls_already_made(messages: list[APICompatibleMessage]) -> list[dict]:
+        """Return previously made tool calls in chronological order."""
+        return [
             {
                 "name": tool_call.name,
                 "arguments": tool_call.arguments,
@@ -216,9 +233,20 @@ class ToolPathAgent(
             if isinstance(message, AssistantMessage) and message.tool_calls
             for tool_call in message.tool_calls
         ]
-        trajectory_prompt = TOOL_PATH_PROMPT.format(
-            tool_calls_already_made=json.dumps(tool_calls_already_made, indent=2)
-        )
+
+    def _generate_tools_trajectory(self, messages: list[APICompatibleMessage], use_gold_trajectory: bool = False) -> list[dict]:
+        """
+        Generate the next message from a user or tool message.
+        """
+        trajectory_instruction = ""
+        tool_calls_already_made = self._get_tool_calls_already_made(messages)
+        if use_gold_trajectory:
+            if self.gold_trajectory is None:
+                self.gold_trajectory = self.load_gold_tool_calls(self.task.id)
+            trajectory_instruction = GOLD_TOOL_PATH_INSTRUCTION.format(gold_tool_calls=json.dumps(self.gold_trajectory, indent=2)) if len(self.gold_trajectory) else ""
+
+        trajectory_prompt = TOOL_PATH_PROMPT.format(tool_calls_already_made=json.dumps(tool_calls_already_made, indent=2),
+                                                    gold_trajectory_instruction=trajectory_instruction)
         assistant_message = generate(
             model=self.llm,
             tools=self.tools,
@@ -227,20 +255,10 @@ class ToolPathAgent(
             call_name="tool_path_response",
             **self.llm_args,
         )
-        if assistant_message.content is None:
-            raise ValueError("Tool trajectory response must contain JSON content.")
-        try:
-            trajectories = json.loads(assistant_message.content)
-        except json.JSONDecodeError as error:
-            raise ValueError("Tool trajectory response must be valid JSON.") from error
-        if not isinstance(trajectories, list) or not all(
-            isinstance(trajectory, dict) for trajectory in trajectories
-        ):
-            raise ValueError("Tool trajectory response must be a JSON list of objects.")
+        trajectories = json.loads(assistant_message.content)
         for trajectory in trajectories:
             for tool in trajectory.get("tools", []):
-                if isinstance(tool, dict) and isinstance(tool.get("tool"), str):
-                    tool["tool"] = tool["tool"].removeprefix("functions.")
+                tool["tool"] = tool["tool"].removeprefix("functions.")
         return trajectories
 
     @staticmethod
@@ -250,26 +268,7 @@ class ToolPathAgent(
         """Return the complete trajectory object with the highest score."""
         if not optional_tool_trajectories:
             return None
-
-        for trajectory in optional_tool_trajectories:
-            if not isinstance(trajectory.get("score"), (int, float)):
-                raise ValueError("Every tool trajectory must have a numeric score.")
-            tools = trajectory.get("tools")
-            if not isinstance(tools, list) or not all(
-                isinstance(tool, dict)
-                and isinstance(tool.get("tool"), str)
-                and isinstance(tool.get("goal"), str)
-                for tool in tools
-            ):
-                raise ValueError(
-                    "Every tool trajectory must have a tools list containing "
-                    "objects with string 'tool' and 'goal' fields."
-                )
-
-        return max(
-            optional_tool_trajectories,
-            key=lambda trajectory: trajectory["score"],
-        )
+        return max(optional_tool_trajectories, key=lambda trajectory: trajectory["score"])
 
     def _generate_next_tool_policy_rules(
         self,
@@ -281,19 +280,15 @@ class ToolPathAgent(
         if len(required_tool_calls) == 0:
             return None
         next_required_tool = required_tool_calls[0]
-        next_tool_goal = self._get_tool_goal(
-            current_trajectory_suggestion, next_required_tool
-        )
+        next_tool_goal = self._get_tool_goal(current_trajectory_suggestion, next_required_tool)
         next_action_instruction = f"""
         Your goal is to select the most relevant policy rules from the policy in order to help the agent following the 
         policy, since it is very long. Given the conversation between the agent and user, which contains the policy, 
         the user request and the state of the reservation, you should select the most relevant 
-        policy rules that are important for the to agent remember before its next tool call, 
-        focusing on policy rules that are relevant to the next tool call and the goal this tool is trying to achieve.
-        Next tool to be called: {next_required_tool}
-        Tool goal: {next_tool_goal}
-        User Data: <list of required user info and preferences for the tool to succeed>
-        Relevant Policy Rules:
+        policy rules that are important for the agent to remember before its next tool call to {next_required_tool}. The goal of this tool call is: {next_tool_goal}.
+        Focus on policy rules that are relevant to this tool call and the goal it is trying to achieve.
+        Try to be concise, select only most relevant policy rules, you can summerize them and use a more strict policy phrasing.
+        Do not add any additional information or explanation.
     """.strip()
 
         policy_messages = agent_messages + [SystemMessage(role="system", content=next_action_instruction)]
@@ -304,45 +299,18 @@ class ToolPathAgent(
             call_name="policy_rules",
             **self.llm_args,
         )
-        return f"Critical policy rules that must be followed exactly in order to call {next_required_tool}:\n{assistant_message.content.strip()}"
+        return (f"The next tool call you will probably need to call is {next_required_tool}, which will help to acheive the goal: "
+                f"{next_tool_goal}.\n"
+                f"Here are critical policy rules that must be followed exactly in order to call"
+                f" {next_required_tool} properly, make sure to follow them:\n{assistant_message.content.strip()}")
 
     @staticmethod
-    def _get_tool_goal(
-        current_trajectory_suggestion: Optional[dict],
-        tool_name: str,
-    ) -> str:
+    def _get_tool_goal(current_trajectory_suggestion: Optional[dict], tool_name: str) -> str | None:
         """Return a tool's goal from the current selected trajectory."""
-        if not current_trajectory_suggestion:
-            return (
-                f"Determine the single atomic goal for {tool_name} from its tool "
-                "schema and the current conversation state."
-            )
-
-        for tool in current_trajectory_suggestion.get("tools", []):
-            if not isinstance(tool, dict):
-                continue
-            suggested_tool_name = str(tool.get("tool", ""))
-            goal = tool.get("goal")
-            if suggested_tool_name == tool_name and isinstance(goal, str):
-                stripped_goal = goal.strip()
-                if stripped_goal:
-                    return stripped_goal
-
-        return (
-            f"Determine the single atomic goal for {tool_name} from its tool "
-            "schema and the current conversation state."
-        )
-
-    def _generate_policy_rules(self, state: ToolPathAgentState) -> str:
-        messages = (state.system_messages + state.messages + [SystemMessage(role="system", content=POLICY_RULES_INSTRUCTION)])
-        assistant_message = generate(
-            model=self.llm,
-            tools=[],
-            messages=messages,
-            call_name="policy_rules",
-            **self.llm_args,
-        )
-        return "Critical policy rules that must be followed exactly:\n" + assistant_message.content.strip()
+        for tool_info in current_trajectory_suggestion.get("tools", []):
+            if tool_info["tool"] == tool_name:
+                return tool_info["goal"]
+        return None
 
     def _generate_next_message(
         self, message: ValidAgentInputMessage, state: ToolPathAgentStateType
@@ -357,15 +325,13 @@ class ToolPathAgent(
         else:
             state.messages.append(message)
         messages = state.system_messages + state.messages
-        optional_tool_trajectories = self._generate_tools_trajectory(messages)
+        optional_tool_trajectories = self._generate_tools_trajectory(messages, state.use_gold_trajectory)
         state.current_trajectory_suggestion = self._get_highest_probability_trajectory(optional_tool_trajectories)
         state.required_tool_calls = [tool["tool"] for tool in (state.current_trajectory_suggestion.get("tools", [])
                 if state.current_trajectory_suggestion else [])]
         print("Tool Path Trajectory Suggestion:", state.required_tool_calls)
         if state.first_tool_calls_suggestions is None:
             state.first_tool_calls_suggestions = optional_tool_trajectories
-            if len(optional_tool_trajectories) > 1:
-                state.high_trajectory_confidence = False
         agent_messages = list(messages)
         next_tool_policy_rules = self._generate_next_tool_policy_rules(agent_messages, state.required_tool_calls, state.current_trajectory_suggestion,)
         if next_tool_policy_rules:
@@ -400,4 +366,5 @@ def create_tool_path_agent(tools, domain_policy, **kwargs):
         domain_policy=domain_policy,
         llm=kwargs.get("llm"),
         llm_args=kwargs.get("llm_args"),
+        task=kwargs.get("task"),
     )
