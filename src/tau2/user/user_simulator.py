@@ -219,7 +219,7 @@ class UserSimulator(
             raise ValueError(
                 "Assistant message cannot be audio. Use VoiceUserSimulator instead."
             )
-        logger.debug(f"User responds to message: {message}")
+        # logger.debug(f"User responds to message: {message}")
         # Updating state with new message
         # Skip empty messages (e.g., empty chunks from streaming mode)
         if isinstance(message, MultiToolMessage):
@@ -241,7 +241,7 @@ class UserSimulator(
         )
 
         user_response = assistant_message.content
-        logger.debug(f"Response: {user_response}")
+        # logger.debug(f"Response: {user_response}")
 
         user_message = UserMessage(
             role="user",

@@ -101,6 +101,7 @@ def run_with_retry(
                 logger.error(
                     f"Task {task.id} failed after {max_attempts} attempts: {e}"
                 )
+                raise e
 
     # All retries exhausted
     error_text = Text(

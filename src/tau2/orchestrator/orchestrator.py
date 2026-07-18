@@ -830,11 +830,21 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         """
         if self.done:
             raise ValueError("Simulation is done")
+        # logger.debug(
+        #     f"Step {self.step_count}. Sending message from {self.from_role} to {self.to_role}"
+        # )
+        if isinstance(self.message, MultiToolMessage):
+            msg_text = "MultiToolMessage:\n"
+            for tc in self.message.tool_messages:
+                msg_text += (str(tc)+"\n")
+        elif self.message.content is not None:
+            msg_text = f"Message: {self.message.content}\n"
+        else:
+            msg_text = "ToolCalls:\n"
+            for tc in self.message.tool_calls:
+                msg_text += (str(tc)+"\n")
         logger.debug(
-            f"Step {self.step_count}. Sending message from {self.from_role} to {self.to_role}"
-        )
-        logger.debug(
-            f"Step {self.step_count}.\nFrom role: {self.from_role}\nTo role: {self.to_role}\nMessage: {self.message}"
+            f"Step {self.step_count}:\nFrom role: {self.from_role} To role: {self.to_role}\n{msg_text}"
         )
         # AGENT/ENV -> USER
         if self.from_role in [Role.AGENT, Role.ENV] and self.to_role == Role.USER:

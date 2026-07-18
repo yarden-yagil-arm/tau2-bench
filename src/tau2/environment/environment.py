@@ -460,7 +460,7 @@ class Environment:
         except Exception as e:
             resp = f"Error: {e}"
             error = True
-        logger.debug(f"Response: {resp}")
+        # logger.debug(f"Response: {resp}")
         resp = self.to_json_str(resp)
         return ToolMessage(
             id=message.id,
