@@ -15,6 +15,7 @@ from tau2.agent.llm_agent import (
     create_llm_solo_agent,
 )
 from tau2.agent.logprobs_agent import create_uncertainty_detection_agent
+from tau2.agent.multi_preds_agents import create_multi_preds_agent
 from tau2.agent.policy_injection_agent import create_policy_injection_agent
 from tau2.agent.state_agent import create_state_agent
 from tau2.agent.tool_path_agent import create_tool_path_agent
@@ -303,6 +304,7 @@ try:
     registry.register_agent_factory(create_policy_injection_agent, "policy_agent")
     registry.register_agent_factory(create_state_agent, "state_agent")
     registry.register_agent_factory(create_tool_path_agent, "tool_path_agent")
+    registry.register_agent_factory(create_multi_preds_agent, "multi_preds_agent")
     registry.register_agent_factory(
         create_llm_gt_agent,
         "llm_agent_gt",
