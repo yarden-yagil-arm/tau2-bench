@@ -42,7 +42,6 @@ SYSTEM_PROMPT = """
 <policy>
 {domain_policy}
 </policy>
-Do not ask the user for extra disambiguation if you can use tools to get the information you need.
 """.strip()
 
 

@@ -38,7 +38,6 @@ SYSTEM_PROMPT = """
 <policy>
 {domain_policy}
 </policy>
-Do not ask the user for extra disambiguation if you can use tools to get the information you need.
 """.strip()
 
 
@@ -60,8 +59,8 @@ Update the previous JSON state using the new messages and make sure the state is
 The state should behave like a compact belief state:
 - Preserve stable facts until the user or a tool result change them.
 - Keep user-provided values separate from tool-observed facts.
-- Keep only tool output fields that are relevant for deciding the next agent actions.
 - Track policy rules that constrain or enable the active request.
+- Keep only tool output fields that are relevant for deciding the next agent actions.
 
 <domain_policy>
 {domain_policy}

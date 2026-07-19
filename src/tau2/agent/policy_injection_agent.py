@@ -44,7 +44,6 @@ SYSTEM_PROMPT = """
 </instructions>
 <policy>
 {domain_policy}
-Do not ask the user for extra disambiguation if you can use tools to get the information you need.
 </policy>
 """.strip()
 
