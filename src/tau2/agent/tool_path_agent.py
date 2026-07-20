@@ -97,7 +97,7 @@ class ToolPathAgentState(BaseModel):
 
     system_messages: list[SystemMessage]
     messages: list[APICompatibleMessage]
-    use_gold_trajectory: bool = True
+    use_gold_trajectory: bool = False
     # print("Gold trajectory is on:", use_gold_trajectory)
 
 
@@ -282,11 +282,9 @@ class ToolPathAgent(
             state.messages.append(message)
         messages = state.system_messages + state.messages
         optional_tool_trajectories = self._generate_tools_trajectory(messages, state.use_gold_trajectory)
-        current_trajectory_suggestion = optional_tool_trajectories#self._get_highest_probability_trajectory(optional_tool_trajectories)
+        current_trajectory_suggestion = optional_tool_trajectories
         agent_messages = list(messages)
         next_tool_policy_rules = self._generate_next_tool_policy_rules(agent_messages, current_trajectory_suggestion)
-        b = self._generate_tools_trajectory(messages, state.use_gold_trajectory)
-        # print("policy rules for next tool call:\n", next_tool_policy_rules)
         if next_tool_policy_rules:
             agent_messages += [SystemMessage(role="system", content=next_tool_policy_rules)]
         assistant_message = generate(
