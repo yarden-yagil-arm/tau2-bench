@@ -18,6 +18,7 @@ from tau2.data_model.message import (
     Message,
     MultiToolMessage,
     SystemMessage,
+    ToolCall,
     UserMessage,
 )
 from tau2.data_model.simulation import Results
@@ -33,6 +34,7 @@ PASSED_SIMULATIONS_PATHS = {
 }
 
 SIMILARITY_EMBEDDING_MODEL = "text-embedding-3-small"
+NUM_CANDIDATES = 5
 
 AGENT_INSTRUCTION = """
 You are a customer service agent that helps the user according to the <policy> provided below.
@@ -130,25 +132,20 @@ class MultiPredsAgent(
         self.domain = domain
         self.task = task
         self.gold_trajectory = self.load_gold_agent_responses(self.task.id, PASSED_SIMULATIONS_PATHS[self.domain])
+        self.gold_tool_calls, self.gold_agent_messages = self._get_gold_tool_calls_and_agent_messages()
+        self.gold_agent_message_embeddings = self._get_normalized_embeddings(self.gold_agent_messages)
+        self.messages_candidates: list[list[AssistantMessage]] = []
 
     @staticmethod
-    def load_gold_agent_responses(task_id: str, simulations_path: str | Path) -> list[dict]:
+    def load_gold_agent_responses(task_id: str, simulations_path: str | Path) -> list[AssistantMessage]:
         """Return agent responses and tool calls from the shortest passed trial."""
         results = Results.load(Path(simulations_path))
         passed_trials_responses = []
         for simulation in results.simulations:
             if simulation.task_id != str(task_id) or simulation.reward_info is None or not is_successful(simulation.reward_info.reward):
                 continue
-            gold_messages = [MultiPredsAgent._format_gold_message(message) for message in simulation.get_messages() if isinstance(message, AssistantMessage)]
-            passed_trials_responses.append(gold_messages)
-        return min(passed_trials_responses, key=len) if passed_trials_responses else []
-
-    @staticmethod
-    def _format_gold_message(message: AssistantMessage) -> dict:
-        """Convert a gold agent response or tool call into a dictionary."""
-        if message.tool_calls:
-            return {"action_type": "tool_call", "action_content": [{"tool": tool_call.name, "arguments": tool_call.arguments} for tool_call in message.tool_calls]}
-        return {"action_type": "agent_response", "action_content": message.content or ""}
+            passed_trials_responses.append(simulation.get_messages())
+        return max(passed_trials_responses, key=len) if passed_trials_responses else []
 
     @property
     def system_prompt(self) -> str:
@@ -196,48 +193,92 @@ class MultiPredsAgent(
         )
         return "Critical policy rules that must be followed exactly:\n" + assistant_message.content.strip()
 
-    def _generate_response_options(self, messages: list[APICompatibleMessage]) -> list:
-        """Generate three likely next actions without making a tool call."""
-        llm_args = {**self.llm_args, "logprobs": True, "top_logprobs": 3}
-        response = generate(
+    def _generate_response_options(self, messages: list[APICompatibleMessage]) -> list[AssistantMessage]:
+        """Generate likely next actions without making a tool call."""
+        llm_args = {
+            **self.llm_args,
+            "logprobs": True,
+            "top_logprobs": 20,
+            "n": NUM_CANDIDATES,
+            "temperature": 1,
+        }
+        responses = generate(
             model=self.llm,
             tools=self.tools,
-            messages=messages + [SystemMessage(role="system", content=MULTI_RESPONSE_PROMPT)],
+            messages=messages,
             call_name="multi_response_options",
             **llm_args,
         )
-        try:
-            return response.choices
-        except json.JSONDecodeError:
-            raise ValueError("Response options must be valid JSON.")
+        if not isinstance(responses, list) or len(responses) != NUM_CANDIDATES or any(not isinstance(response, AssistantMessage) for response in responses):
+            raise ValueError(f"Response options must be exactly {NUM_CANDIDATES} AssistantMessage objects.")
+        self.messages_candidates.append(responses)
+        return responses
+
+    def _get_gold_tool_calls_and_agent_messages(self) -> tuple[list[ToolCall], list[str]]:
+        """Split the gold trajectory into tool calls and agent text messages."""
+        gold_tool_calls = []
+        gold_agent_messages = []
+        for gold_message in self.gold_trajectory:
+            if not isinstance(gold_message, AssistantMessage):
+                continue
+            if gold_message.tool_calls:
+                gold_tool_calls.extend(gold_message.tool_calls)
+            else:
+                gold_agent_messages.append(gold_message.content or "")
+        return gold_tool_calls, gold_agent_messages
+
+    def _is_tool_call_in_gold_tool_calls(self, tool_call: ToolCall) -> bool:
+        """Return whether a tool call's name and arguments match a gold tool call."""
+        return any(
+            gold_tool_call.name == tool_call.name
+            and gold_tool_call.arguments == tool_call.arguments
+            for gold_tool_call in self.gold_tool_calls
+        )
+
+    @staticmethod
+    def _get_normalized_embeddings(messages: list[str]) -> np.ndarray:
+        """Generate normalized embeddings for messages."""
+        embedding_response = embedding(model=SIMILARITY_EMBEDDING_MODEL, input=messages)
+        embeddings = np.array([item["embedding"] for item in embedding_response["data"]], dtype=float)
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        return np.divide(embeddings, norms, out=np.zeros_like(embeddings), where=norms != 0)
 
 
     def next_action_heuristic(
         self,
-        options: list,
+        candidates: list[AssistantMessage],
         agent_messages: list[APICompatibleMessage],
     ) -> int:
         """Select the option with the highest cosine similarity to a gold item."""
 
-        if not isinstance(options, list) or len(options) != 3 or any(not isinstance(option, dict) for option in options):
-            raise ValueError("Response options must be exactly three dictionaries.")
+        if len(candidates) != NUM_CANDIDATES or any(not isinstance(option, AssistantMessage) for option in candidates):
+            raise ValueError(f"Response candidates must be exactly {NUM_CANDIDATES} AssistantMessage objects.")
+        num_candidates_with_tools = sum([bool(candidate.tool_calls) for candidate in candidates])
+        if 1 <=  num_candidates_with_tools < NUM_CANDIDATES:
+            # If more than half of the candidates have tool calls, filter to only those with tool calls; otherwise, filter to only those without tool calls.
+            tool_call_filter = True if num_candidates_with_tools > NUM_CANDIDATES / 2 else False
+            candidates = [candidate for candidate in candidates if bool(candidate.tool_calls) == tool_call_filter]
 
-        gold_trajectory = [gold_message["action_content"] for gold_message in self.gold_trajectory if gold_message["action_type"] == options[0]["action_type"]]
-        option_contents = [option["action_content"] for option in options]
-        gold_trajectory = [content if isinstance(content, str) else json.dumps(content, sort_keys=True) for content in gold_trajectory]
-        option_contents = [content if isinstance(content, str) else json.dumps(content, sort_keys=True) for content in option_contents]
-        if not gold_trajectory:
-            raise ValueError(f"No gold items found for action type {options[0]['action_type']}.")
-        embedding_response = embedding(model=SIMILARITY_EMBEDDING_MODEL, input=option_contents + gold_trajectory)
-        embeddings = np.array([item["embedding"] for item in embedding_response["data"]], dtype=float)
-        option_embeddings = embeddings[:len(option_contents)]
-        gold_embeddings = embeddings[len(option_contents):]
-        option_norms = np.linalg.norm(option_embeddings, axis=1, keepdims=True)
-        gold_norms = np.linalg.norm(gold_embeddings, axis=1, keepdims=True)
-        normalized_options = np.divide(option_embeddings, option_norms, out=np.zeros_like(option_embeddings), where=option_norms != 0)
-        normalized_gold = np.divide(gold_embeddings, gold_norms, out=np.zeros_like(gold_embeddings), where=gold_norms != 0)
-        similarities = normalized_options @ normalized_gold.T
-        return int(np.argmax(np.max(similarities, axis=1)))
+
+        if candidates[0].tool_calls:
+            matching_candidate_indices = []
+            for idx, c in enumerate(candidates):
+                if any([self._is_tool_call_in_gold_tool_calls(tool_call) for tool_call in c.tool_calls]):
+                    matching_candidate_indices.append(idx)
+            if not matching_candidate_indices:
+                print(f"Tool call does not match any gold tool call. Tool:", [tool_call.name for tool_call in candidates[0].tool_calls])
+                return 0
+            return min(matching_candidate_indices)
+
+        candidate_contents = [candidate.content for candidate in candidates]
+        candidate_embeddings = self._get_normalized_embeddings(candidate_contents)
+        similarities = np.dot(candidate_embeddings, self.gold_agent_message_embeddings.T)
+        candidate_similarities = np.max(similarities, axis=1)
+        selected_candidate_index = int(np.argmax(candidate_similarities))
+        selected_gold_message_index = int(np.argmax(similarities[selected_candidate_index]))
+        print("Selected gold message:", self.gold_agent_messages[selected_gold_message_index])
+        print("Selected candidate message:", candidates[selected_candidate_index].content)
+        return selected_candidate_index
 
     def _generate_next_message(
         self, message: ValidAgentInputMessage, state: MultiPredsAgentStateType
@@ -254,21 +295,10 @@ class MultiPredsAgent(
         messages = state.system_messages + state.messages
         agent_messages = list(messages)
         # policy_rules = self._generate_policy_rules(agent_messages)
-        # next_action_options = self._generate_response_options(agent_messages + [SystemMessage(role="system", content=policy_rules)])
         next_action_options = self._generate_response_options(agent_messages)
         selected_action_index = self.next_action_heuristic(next_action_options, agent_messages)
         selected_action = next_action_options[selected_action_index]
-        print(selected_action["action_content"])
-        agent_messages.append(SystemMessage(role="system", content=SELECTED_ACTION_PROMPT.format(selected_action=selected_action)))
-        assistant_message = generate(
-            model=self.llm,
-            tools=self.tools,
-            messages=agent_messages,
-            call_name="agent_response",
-            **self.llm_args,
-        )
-        return assistant_message
-
+        return selected_action
 
 # =============================================================================
 # AGENT FACTORY FUNCTIONS
